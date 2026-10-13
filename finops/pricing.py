@@ -60,21 +60,118 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# Interruption rates by GPU type (snapshot from major cloud providers 2026)
+GPU_SPOT_INTERRUPT_RATES: dict[str, float] = {
+    "H100": 0.08,   # High demand / contention, ~8% per hour
+    "H200": 0.12,   # Very scarce, ~12% per hour
+    "A100": 0.05,   # Moderate demand, ~5% per hour
+    "A10G": 0.03,   # Commodity GPU, ~3% per hour
+    "L4": 0.02,     # Inference commodity, ~2% per hour
+    "B200": 0.15,   # Cutting-edge, high preemption
+    "MI300X": 0.04,
+}
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    interruption_rate: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Enhanced policy (Extension 1):
+      - Considers interruption rate by GPU type and checkpoint overhead.
+      - Supports job duration (job_days) to distinguish reserved commitments.
+      - Maintains 100% backward compatibility when optional parameters are omitted.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
+    if gpu_type is None and job_days is None and interruption_rate is None:
+        if interruptible and hours_per_day < 24:
+            return "spot"
+        if duty >= be:
+            return "reserved"
+        return "on_demand"
+
+    # Enhanced logic:
+    rate = interruption_rate if interruption_rate is not None else GPU_SPOT_INTERRUPT_RATES.get(gpu_type or "", 0.05)
     if interruptible and hours_per_day < 24:
-        return "spot"
+        # If preemption rate is excessive (>20%/hr), checkpoint rework erodes spot savings
+        if rate < 0.20:
+            return "spot"
+
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def recommend_tier_matrix(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str,
+    job_days: int,
+    reserved_1yr_discount: float = 0.20,
+    reserved_3yr_discount: float = 0.45,
+) -> dict:
+    """Matrix recommendation considering 1yr vs 3yr commitment duration and interruption rate."""
+    duty = max(0.0, hours_per_day) / 24.0
+    rate = GPU_SPOT_INTERRUPT_RATES.get(gpu_type, 0.05)
+    be_3yr = break_even_utilization(reserved_3yr_discount)
+    be_1yr = break_even_utilization(reserved_1yr_discount)
+
+    if interruptible and hours_per_day < 24 and rate < 0.20:
+        tier = "spot"
+        reason = f"Workload interruptible & spot preemption rate ({rate:.1%}) within acceptable threshold"
+    elif duty >= be_3yr and job_days >= 365:
+        tier = "reserved_3yr"
+        reason = f"High duty cycle ({duty:.0%} >= {be_3yr:.0%}) & long horizon ({job_days}d >= 365d) qualifies for 3yr commitment"
+    elif duty >= be_1yr and job_days >= 90:
+        tier = "reserved_1yr"
+        reason = f"Steady duty cycle ({duty:.0%} >= {be_1yr:.0%}) & medium horizon ({job_days}d) qualifies for 1yr commitment"
+    else:
+        tier = "on_demand"
+        reason = f"Duty cycle ({duty:.0%}) below break-even or short transient duration ({job_days}d)"
+
+    return {
+        "recommended_tier": tier,
+        "interruption_rate": rate,
+        "duty_cycle": round(duty, 3),
+        "reason": reason,
+    }
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    read_price_per_m: float = 3.00,
+) -> bool:
+    """Cache pays off only when total savings from subsequent reads > write/storage cost.
+
+    Breakeven: avg_cache_reads * (read_price_per_m * (1 - read_discount)) >= write_cost_per_m
+    Example: With 90% read discount (Anthropic/Gemini), savings per read is 0.9 * read_price.
+    If write_cost is 1.25x read_price ($3.75 vs $3.00), break-even requires >= 1.39 reads.
+    """
+    savings_per_read = read_price_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return False
+    return (avg_cache_reads * savings_per_read) >= write_cost_per_m
+
+
+def cache_breakeven_reads(
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    read_price_per_m: float = 3.00,
+) -> float:
+    """Number of cache reads required to break even against initial write cost."""
+    savings_per_read = read_price_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return float("inf")
+    return round(write_cost_per_m / savings_per_read, 2)
 
 
 def spot_checkpoint_cost(
